@@ -8,6 +8,94 @@ from sklearn.utils.validation import check_is_fitted
 from .utils import check_y_survival
 
 
+def _build_warm_start_estimator(estimator, estimator_params, default_params=None):
+    """Build a warm-start classifier initialized for incremental fitting.
+
+    Configures the estimator with ``warm_start=True`` and an initial iteration
+    count of 1 (via ``max_iter`` or ``n_estimators``) so the training loop can
+    increment it one step at a time.
+
+    Parameters
+    ----------
+    estimator : class or None
+        Sklearn-compatible classifier class to instantiate. If ``None``,
+        :class:`~sklearn.ensemble.HistGradientBoostingClassifier` is used.
+
+    estimator_params : dict or None
+        Parameters passed to the estimator constructor. When ``estimator`` is
+        ``None``, these override ``default_params``.
+
+    default_params : dict or None
+        Default parameters used when ``estimator`` is ``None`` and
+        ``estimator_params`` is ``None``. Typically contains tree hyperparameters
+        such as ``learning_rate``, ``max_leaf_nodes``, etc.
+
+    Returns
+    -------
+    clf : classifier instance
+        A configured warm-start classifier ready for incremental fitting.
+    """
+    if estimator is None:
+        params = {"loss": "log_loss", **(default_params or {})}
+        if estimator_params is not None:
+            params.update(estimator_params)
+        # Always enforce warm_start and initial iteration count for the loop.
+        params["warm_start"] = True
+        params["max_iter"] = 1
+        return HistGradientBoostingClassifier(**params)
+    else:
+        params = {"warm_start": True, **(estimator_params or {})}
+        clf = estimator(**params)
+        # Force the starting iteration count to 1; the training loop will
+        # increment it at each boosting step.
+        if hasattr(clf, "max_iter"):
+            clf.max_iter = 1
+        elif hasattr(clf, "n_estimators"):
+            clf.n_estimators = 1
+        else:
+            raise ValueError(
+                f"{type(clf).__name__} must expose either 'max_iter' or "
+                "'n_estimators' to support incremental warm_start fitting. "
+                "XGBClassifier, LGBMClassifier, and CatBoostClassifier all "
+                "satisfy this requirement via their sklearn-compatible APIs."
+            )
+        return clf
+
+
+def _step_warm_start_fit(estimator, X, y, sample_weight=None):
+    """Increment the estimator's iteration count by 1 and refit.
+
+    Supports both sklearn-style estimators (``max_iter``) and boosting library
+    wrappers such as XGBoost, LightGBM, and CatBoost (``n_estimators``), as
+    long as ``warm_start=True`` is set.
+
+    Parameters
+    ----------
+    estimator : fitted classifier
+        Must have ``warm_start=True`` and expose ``max_iter`` or
+        ``n_estimators``.
+
+    X : array-like of shape (n_samples, n_features)
+        Training features.
+
+    y : array-like of shape (n_samples,)
+        Training targets.
+
+    sample_weight : array-like of shape (n_samples,) or None
+        Sample weights passed to ``estimator.fit``.
+    """
+    if hasattr(estimator, "max_iter"):
+        estimator.max_iter += 1
+    elif hasattr(estimator, "n_estimators"):
+        estimator.n_estimators += 1
+    else:
+        raise AttributeError(
+            f"{type(estimator).__name__} does not expose 'max_iter' or "
+            "'n_estimators'. Cannot perform incremental warm_start fitting."
+        )
+    estimator.fit(X, y, sample_weight=sample_weight)
+
+
 class KaplanMeierIPCW:
     """Estimate the Inverse Probability of Censoring Weight (IPCW).
 
@@ -188,15 +276,37 @@ class AlternatingCensoringEstimator(KaplanMeierIPCW):
         The incidence estimator is fit outside of this class, and its predictions are
         used as sample weights to fit the censoring estimator.
 
+    estimator : class or None, default=None
+        The sklearn-compatible classifier class to use for the censoring estimator.
+        If ``None``, :class:`~sklearn.ensemble.HistGradientBoostingClassifier` is used.
+        Compatible alternatives include ``XGBClassifier``, ``LGBMClassifier``, and
+        ``CatBoostClassifier`` via their sklearn-compatible APIs.
+
+        When a custom estimator is provided, ``estimator_params`` should be used to
+        configure it instead of the ``learning_rate``, ``max_leaf_nodes``,
+        ``max_depth``, and ``min_samples_leaf`` parameters below.
+
+        The estimator must support ``warm_start=True`` and expose either ``max_iter``
+        or ``n_estimators`` for incremental fitting.
+
+    estimator_params : dict or None, default=None
+        Parameters passed to the ``estimator`` constructor. When ``estimator`` is
+        ``None``, these override the default
+        :class:`~sklearn.ensemble.HistGradientBoostingClassifier` parameters.
+        ``warm_start`` and the initial iteration count are always managed by the
+        training loop and cannot be overridden via this dict.
+
     learning_rate : float, default=0.05
         The learning rate, similar to the argument in SurvivalBoost constructor.
+        Ignored when ``estimator_params`` is provided.
 
     max_depth : int, default=None
         The maximum depth of each tree, similar to the argument in SurvivalBoost
-        constructor.
+        constructor. Ignored when ``estimator_params`` is provided.
 
     min_samples_leaf : int, default=50
         The minimum number of samples per leaf.
+        Ignored when ``estimator_params`` is provided.
 
     epsilon_censoring_prob : float, default=0.05
         Lower limit of the predicted censoring probabilities. It helps avoiding
@@ -212,6 +322,8 @@ class AlternatingCensoringEstimator(KaplanMeierIPCW):
         self,
         cold_start_ipcw_estimator=None,
         incidence_estimator=None,
+        estimator=None,
+        estimator_params=None,
         learning_rate=0.05,
         max_depth=None,
         max_leaf_nodes=31,
@@ -220,6 +332,8 @@ class AlternatingCensoringEstimator(KaplanMeierIPCW):
     ):
         self.cold_start_ipcw_estimator = cold_start_ipcw_estimator
         self.incidence_estimator = incidence_estimator
+        self.estimator = estimator
+        self.estimator_params = estimator_params
         self.learning_rate = learning_rate
         self.max_leaf_nodes = max_leaf_nodes
         self.max_depth = max_depth
@@ -280,9 +394,8 @@ class AlternatingCensoringEstimator(KaplanMeierIPCW):
             self.censoring_estimator_ = self._build_censoring_estimator()
 
         X_with_time = np.hstack([times, X])
-        self.censoring_estimator_.max_iter += 1
-        self.censoring_estimator_.fit(
-            X_with_time, y_binary, sample_weight=sample_weight
+        _step_warm_start_fit(
+            self.censoring_estimator_, X_with_time, y_binary, sample_weight
         )
 
         return self
@@ -343,12 +456,13 @@ class AlternatingCensoringEstimator(KaplanMeierIPCW):
             )
 
     def _build_censoring_estimator(self):
-        return HistGradientBoostingClassifier(
-            loss="log_loss",
-            max_iter=1,
-            warm_start=True,
-            learning_rate=self.learning_rate,
-            max_leaf_nodes=self.max_leaf_nodes,
-            max_depth=self.max_depth,
-            min_samples_leaf=self.min_samples_leaf,
+        return _build_warm_start_estimator(
+            estimator=self.estimator,
+            estimator_params=self.estimator_params,
+            default_params=dict(
+                learning_rate=self.learning_rate,
+                max_leaf_nodes=self.max_leaf_nodes,
+                max_depth=self.max_depth,
+                min_samples_leaf=self.min_samples_leaf,
+            ),
         )

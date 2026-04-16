@@ -408,7 +408,7 @@ class SurvivalBoost(BaseEstimator, ClassifierMixin):
             Returns an instance of self.
         """
 
-        X = check_array(X, force_all_finite="allow-nan")
+        X = check_array(X, ensure_all_finite="allow-nan")
         event, duration = check_y_survival(y)
 
         # Add 0 as a special event id for the survival function.
@@ -458,21 +458,30 @@ class SurvivalBoost(BaseEstimator, ClassifierMixin):
         if self.show_progressbar:
             iterator = tqdm(iterator)
 
+        n_samples = X.shape[0]
+        n_horizons = self.n_horizons_per_observation
+        total_rows = n_samples * n_horizons
+
+        # Pre-allocate buffers once and reuse across all boosting iterations
+        # to avoid repeated vstack/hstack copies.
+        X_with_time = np.empty((total_rows, X.shape[1] + 1))
+        y_targets = np.empty(total_rows)
+        sample_weight = np.empty(total_rows)
+
         for idx_iter in iterator:
-            X_with_time = np.empty((0, X.shape[1] + 1))
-            y_targets = np.empty((0,))
-            sample_weight = np.empty((0,))
-            for _ in range(self.n_horizons_per_observation):
+            for j in range(n_horizons):
+                start = j * n_samples
+                end = start + n_samples
                 (
                     sampled_times_,
                     y_targets_,
                     sample_weight_,
                 ) = self.weighted_targets_.draw(X=X, ipcw_training=False)
 
-                X_with_time_ = np.hstack([sampled_times_, X])
-                X_with_time = np.vstack([X_with_time, X_with_time_])
-                y_targets = np.hstack([y_targets, y_targets_])
-                sample_weight = np.hstack([sample_weight, sample_weight_])
+                X_with_time[start:end, 0:1] = sampled_times_
+                X_with_time[start:end, 1:] = X
+                y_targets[start:end] = y_targets_
+                sample_weight[start:end] = sample_weight_
 
             _step_warm_start_fit(
                 self.estimator_, X_with_time, y_targets, sample_weight

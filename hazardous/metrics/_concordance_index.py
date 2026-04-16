@@ -275,8 +275,15 @@ def _concordance_index_incidence_report(
     c_index_report = defaultdict(list)
     c_index_report["taus"] = taus
 
+    # Pre-sort the time grid once so that _interpolate_sorted can skip
+    # the O(n log n) argsort + array copy on every iteration.
+    time_grid_arr = np.asarray(time_grid)
+    order = np.argsort(time_grid_arr)
+    sorted_grid = time_grid_arr[order]
+    sorted_pred = y_pred[:, order]
+
     for tau in taus:
-        y_pred_tau = interpolate_preds(y_pred, time_grid, tau)
+        y_pred_tau = _interpolate_sorted(sorted_pred, sorted_grid, tau)
         y_test_tau = y_test.copy()
         y_test_tau.loc[y_test_tau["duration"] > tau, "event"] = 0
         c_index_report_tau = _concordance_index_tau(
@@ -400,7 +407,6 @@ class _StatsComputer:
 
             diff = y_pred_i - pred_tail
             mask_ties_pred = np.abs(diff) <= tied_tol
-            # diff > tied_tol is equivalent to (y_pred_i > pred_tail) & ~mask_ties
             mask_strict_concordant = diff > tied_tol
 
             stats["n_ties_pred"] += mask_ties_pred.sum()
@@ -512,9 +518,11 @@ def interpolate_preds(y_pred, time_grid, tau):
     """Interpolated the values of y_pred at tau."""
     time_grid = np.asarray(time_grid)
     order = np.argsort(time_grid)
-    sorted_grid = time_grid[order]
-    sorted_pred = y_pred[:, order]
+    return _interpolate_sorted(y_pred[:, order], time_grid[order], tau)
 
+
+def _interpolate_sorted(sorted_pred, sorted_grid, tau):
+    """Interpolate predictions at *tau* given an already-sorted time grid."""
     tau = np.clip(tau, sorted_grid[0], sorted_grid[-1])
 
     idx_right = np.searchsorted(sorted_grid, tau, side="right")

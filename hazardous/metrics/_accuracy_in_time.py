@@ -129,8 +129,7 @@ def accuracy_in_time(y_test, y_pred, time_grid, quantiles=None):
     event_test = np.asarray(y_test["event"])
     duration_test = np.asarray(y_test["duration"])
 
-    # Precompute indices into time_grid for each tau (all taus are guaranteed
-    # to be elements of time_grid).
+    # All taus are guaranteed to be elements of time_grid.
     tau_indices = np.searchsorted(time_grid, taus)
 
     acc_in_time = np.empty(len(taus))

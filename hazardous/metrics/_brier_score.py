@@ -154,37 +154,19 @@ class IncidenceScoreComputer:
                 f"must be equal to y_pred.shape[1] ({y_pred.shape[1]})."
             )
 
-        if self.event_of_interest == "any":
-            k = 1
-        else:
-            k = self.event_of_interest
+        k = 1 if self.event_of_interest == "any" else self.event_of_interest
 
-        # Vectorize the Brier score computation across all time steps at once
-        # using broadcasting.  Shapes: duration_true is (n_samples,), times is
-        # (n_times,).  We expand to (n_samples, 1) vs (1, n_times) so that
-        # every element-wise comparison produces an (n_samples, n_times) mask.
-        dur = duration_true[:, np.newaxis]  # (n_samples, 1)
-        t = times[np.newaxis, :]  # (1, n_times)
-
-        # Binary targets: 1 when event k occurred before the time horizon.
-        event_k_before_horizon = (event_true[:, np.newaxis] == k) & (dur <= t)
-        y_binary = event_k_before_horizon.astype(np.float64)
-
-        # IPCW weights at observation durations — one value per sample,
-        # independent of the time grid.
+        # Vectorize across all time steps at once using broadcasting.
         ipcw_y = self.ipcw_estimator.compute_ipcw_at(duration_true)
-
-        # IPCW weights at each time-grid point — one value per time step,
-        # independent of the sample.  Called once for the full grid instead of
-        # once per time step.
         ipcw_t = self.ipcw_estimator.compute_ipcw_at(times)
 
-        after_horizon = dur > t  # (n_samples, n_times)
-        weights = np.where(after_horizon, ipcw_t[np.newaxis, :], 0)
-
-        any_event_before_horizon = (event_true[:, np.newaxis] > 0) & (dur <= t)
-        weights = np.where(
-            any_event_before_horizon, ipcw_y[:, np.newaxis], weights
+        y_binary, weights = self._targets_and_weights(
+            event_true[:, np.newaxis],
+            duration_true[:, np.newaxis],
+            times[np.newaxis, :],
+            ipcw_y[:, np.newaxis],
+            ipcw_t[np.newaxis, :],
+            k,
         )
 
         # XXX: refactor and rename this function to make it possible to
@@ -216,6 +198,33 @@ class IncidenceScoreComputer:
         time_span = sorted_times[-1] - sorted_times[0]
         return _trapezoid(sorted_scores, sorted_times) / time_span
 
+    @staticmethod
+    def _targets_and_weights(
+        y_event, y_duration, times, ipcw_y_duration, ipcw_times, k
+    ):
+        """Compute binary targets and IPCW weights.
+
+        All array arguments must be broadcast-compatible.  This is the shared
+        core of both ``_weighted_binary_targets`` (1D, per-sample times used
+        during training) and ``brier_score_incidence`` (2D, broadcasted time
+        grid used during evaluation).
+
+        The IPCW scheme for survival analysis (binary events) is described
+        in [Graf1999] and extended to multiple competing events in
+        [Kretowska2018].
+        """
+        # Binary target: 1 when event k occurred before the time horizon,
+        # 0 otherwise (competing event, censored, or event after horizon).
+        # Censored observations before the horizon get zero weight below.
+        event_k_before_horizon = (y_event == k) & (y_duration <= times)
+        y_binary = event_k_before_horizon.astype(np.float64)
+
+        weights = np.where(y_duration > times, ipcw_times, 0.0)
+        weights = np.where(
+            (y_event > 0) & (y_duration <= times), ipcw_y_duration, weights
+        )
+        return y_binary, weights
+
     def _weighted_binary_targets(
         self,
         y_event,
@@ -225,49 +234,13 @@ class IncidenceScoreComputer:
         ipcw_training=False,
         X=None,
     ):
-        if self.event_of_interest == "any":
-            # y should already be provided as binary indicator
-            k = 1
-        else:
-            k = self.event_of_interest
-
-        # Specify the binary classification target for each record in y and a
-        # reference time horizon:
-        #
-        # - 1 when event of interest was observed before the reference time
-        #   horizon,
-        #
-        # - 0 otherwise: any competing event happening at any time, censored
-        #   record or event of interest happening after the reference time
-        #   horizon.
-        #
-        #   Note: censored events only contribute (as negative target) when
-        #   their duration is larger than the reference target horizon.
-        #   Otherwise, they are discarded by setting their weight to 0 in the
-        #   following.
-        #
-        #   Contrary to censored records, competing events always contribute as
-        #   negative targets. There weight is always non-zero but differ if
-        #   they happen either before or after the reference time horizon.
-        #
-        # This IPCW scheme for survival analysis (binary events) is described
-        # in [Graf1999] and is extended to multiple competing events in
-        # [Kretowska2018].
-        event_k_before_horizon = (y_event == k) & (y_duration <= times)
-        y_binary = event_k_before_horizon.astype(np.int32)
-
+        k = 1 if self.event_of_interest == "any" else self.event_of_interest
         ipcw_times = self.ipcw_estimator.compute_ipcw_at(
-            times,
-            X=X,
-            ipcw_training=ipcw_training,
+            times, X=X, ipcw_training=ipcw_training,
         )
-        any_event_or_censoring_after_horizon = y_duration > times
-        weights = np.where(any_event_or_censoring_after_horizon, ipcw_times, 0)
-
-        any_observed_event_before_horizon = (y_event > 0) & (y_duration <= times)
-        weights = np.where(any_observed_event_before_horizon, ipcw_y_duration, weights)
-
-        return y_binary, weights
+        return self._targets_and_weights(
+            y_event, y_duration, times, ipcw_y_duration, ipcw_times, k
+        )
 
 
 def brier_score_survival(

@@ -2,11 +2,15 @@ from numbers import Real
 
 import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.utils.validation import check_array, check_random_state
 from tqdm import tqdm
 
-from ._ipcw import AlternatingCensoringEstimator, KaplanMeierIPCW
+from ._ipcw import (
+    AlternatingCensoringEstimator,
+    KaplanMeierIPCW,
+    _build_warm_start_estimator,
+    _step_warm_start_fit,
+)
 from .metrics._brier_score import (
     IncidenceScoreComputer,
     integrated_brier_score_incidence,
@@ -278,10 +282,34 @@ class SurvivalBoost(BaseEstimator, ClassifierMixin):
         The number of time horizons to sample for each individual in the
         training at each stochastic boosting iteration (epoch).
 
+    estimator : class or None, default=None
+        The sklearn-compatible classifier class to use as the base estimator for
+        both the incidence and censoring models. If ``None``,
+        :class:`~sklearn.ensemble.HistGradientBoostingClassifier` is used.
+
+        Compatible alternatives include ``XGBClassifier``, ``LGBMClassifier``,
+        and ``CatBoostClassifier`` via their sklearn-compatible APIs, e.g.::
+
+            from xgboost import XGBClassifier
+            SurvivalBoost(estimator=XGBClassifier, estimator_params={"max_depth": 3})
+
+        The class must support ``warm_start=True`` and expose either ``max_iter``
+        or ``n_estimators``, which the training loop manages internally.
+        When a custom estimator is provided, ``estimator_params`` should be used
+        to configure it; the ``learning_rate``, ``max_leaf_nodes``, ``max_depth``,
+        and ``min_samples_leaf`` parameters are ignored.
+
+    estimator_params : dict or None, default=None
+        Parameters passed to the ``estimator`` constructor. When ``estimator``
+        is ``None``, these override the default
+        :class:`~sklearn.ensemble.HistGradientBoostingClassifier` parameters.
+        ``warm_start`` and the iteration count are always managed internally and
+        cannot be overridden.
+
     Attributes
     ----------
-    estimator_ : HistGradientBoostingClassifier
-        The base estimator used to fit the CIF and survival function.
+    estimator_ : classifier instance
+        The fitted base estimator used for the CIF and survival function.
 
     classes_ : ndarray of shape (n_classes,)
         The events seen during training.
@@ -332,6 +360,8 @@ class SurvivalBoost(BaseEstimator, ClassifierMixin):
         n_iter_before_feedback=20,
         random_state=None,
         n_horizons_per_observation=3,
+        estimator=None,
+        estimator_params=None,
     ):
         self.hard_zero_fraction = hard_zero_fraction
         self.n_iter = n_iter
@@ -346,6 +376,8 @@ class SurvivalBoost(BaseEstimator, ClassifierMixin):
         self.ipcw_strategy = ipcw_strategy
         self.random_state = random_state
         self.n_horizons_per_observation = n_horizons_per_observation
+        self.estimator = estimator
+        self.estimator_params = estimator_params
 
     def fit(self, X, y, times=None):
         """Fit the model.
@@ -402,7 +434,9 @@ class SurvivalBoost(BaseEstimator, ClassifierMixin):
 
         if self.ipcw_strategy == "alternating":
             ipcw_estimator = AlternatingCensoringEstimator(
-                incidence_estimator=self.estimator_
+                incidence_estimator=self.estimator_,
+                estimator=self.estimator,
+                estimator_params=self.estimator_params,
             )
         elif self.ipcw_strategy == "kaplan-meier":
             ipcw_estimator = KaplanMeierIPCW()
@@ -440,8 +474,9 @@ class SurvivalBoost(BaseEstimator, ClassifierMixin):
                 y_targets = np.hstack([y_targets, y_targets_])
                 sample_weight = np.hstack([sample_weight, sample_weight_])
 
-            self.estimator_.max_iter += 1
-            self.estimator_.fit(X_with_time, y_targets, sample_weight=sample_weight)
+            _step_warm_start_fit(
+                self.estimator_, X_with_time, y_targets, sample_weight
+            )
 
             if not np.array_equal(self.estimator_.classes_, self.event_ids_):
                 raise ValueError(
@@ -573,14 +608,15 @@ class SurvivalBoost(BaseEstimator, ClassifierMixin):
         return self.predict_cumulative_incidence(X, times=times)[:, 0, :]
 
     def _build_base_estimator(self):
-        return HistGradientBoostingClassifier(
-            loss="log_loss",
-            max_iter=1,
-            warm_start=True,
-            learning_rate=self.learning_rate,
-            max_leaf_nodes=self.max_leaf_nodes,
-            max_depth=self.max_depth,
-            min_samples_leaf=self.min_samples_leaf,
+        return _build_warm_start_estimator(
+            estimator=self.estimator,
+            estimator_params=self.estimator_params,
+            default_params=dict(
+                learning_rate=self.learning_rate,
+                max_leaf_nodes=self.max_leaf_nodes,
+                max_depth=self.max_depth,
+                min_samples_leaf=self.min_samples_leaf,
+            ),
         )
 
     def score(self, X, y):

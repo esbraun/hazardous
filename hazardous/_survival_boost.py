@@ -11,11 +11,7 @@ from ._ipcw import (
     _build_warm_start_estimator,
     _step_warm_start_fit,
 )
-from .metrics._brier_score import (
-    IncidenceScoreComputer,
-    integrated_brier_score_incidence,
-    integrated_brier_score_survival,
-)
+from .metrics._brier_score import IncidenceScoreComputer
 from .utils import check_y_survival
 
 
@@ -580,20 +576,29 @@ class SurvivalBoost(BaseEstimator, ClassifierMixin):
         if times is None:
             times = self.time_grid_
 
+        times = np.asarray(times)
+        n_samples = X.shape[0]
+        n_times = times.shape[0]
+        n_classes = len(self.event_ids_)
+
+        # Pre-allocate the augmented feature matrix once; only the time column
+        # (column 0) changes across iterations — the feature columns are fixed.
+        X_with_time = np.empty((n_samples, X.shape[1] + 1))
+        X_with_time[:, 1:] = X
+
+        # Pre-allocate the output array in its final layout so we avoid the
+        # list-append + np.array + transpose overhead.
+        predicted_curves = np.empty((n_samples, n_classes, n_times))
+
+        iterator = enumerate(times)
         if self.show_progressbar:
-            times = tqdm(times)
+            iterator = tqdm(iterator, total=n_times)
 
-        predictions_at_all_times = []
+        for i, t in iterator:
+            X_with_time[:, 0] = t
+            predicted_curves[:, :, i] = self.estimator_.predict_proba(X_with_time)
 
-        for t in times:
-            t = np.full((X.shape[0], 1), fill_value=t)
-            X_with_time = np.hstack([t, X])
-            predictions_at_t = self.estimator_.predict_proba(X_with_time)
-            predictions_at_all_times.append(predictions_at_t)
-
-        predicted_curves = np.array(predictions_at_all_times)
-        # roll axis to get a shape (n_samples, n_events + 1, n_times)
-        return np.transpose(predicted_curves, axes=(1, 2, 0))
+        return predicted_curves
 
     def predict_survival_function(self, X, times=None):
         """Estimate the conditional any-event survival function.
@@ -658,23 +663,27 @@ class SurvivalBoost(BaseEstimator, ClassifierMixin):
         .score method to match the objective function used at fit time.
         """
         predicted_curves = self.predict_cumulative_incidence(X)
+
+        # Fit the IPCW estimator once and reuse it across all events.  The
+        # censoring distribution G(t) is independent of event k, so the
+        # Kaplan-Meier fit is identical for every call.
+        scorer = IncidenceScoreComputer(
+            self.weighted_targets_.y_train,
+            event_of_interest="any",
+        )
+
         ibs_events = []
         for event_idx in self.event_ids_:
             predicted_curves_for_event = predicted_curves[:, event_idx]
             if event_idx == 0:
-                ibs_event = integrated_brier_score_survival(
-                    y_train=self.weighted_targets_.y_train,
-                    y_test=y,
-                    y_pred=predicted_curves_for_event,
-                    times=self.time_grid_,
+                scorer.event_of_interest = "any"
+                ibs_event = scorer.integrated_brier_score_survival(
+                    y, predicted_curves_for_event, self.time_grid_
                 )
             else:
-                ibs_event = integrated_brier_score_incidence(
-                    y_train=self.weighted_targets_.y_train,
-                    y_test=y,
-                    y_pred=predicted_curves_for_event,
-                    times=self.time_grid_,
-                    event_of_interest=event_idx,
+                scorer.event_of_interest = event_idx
+                ibs_event = scorer.integrated_brier_score_incidence(
+                    y, predicted_curves_for_event, self.time_grid_
                 )
             ibs_events.append(ibs_event)
         return -np.mean(ibs_events)

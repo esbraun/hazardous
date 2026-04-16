@@ -154,24 +154,42 @@ class IncidenceScoreComputer:
                 f"must be equal to y_pred.shape[1] ({y_pred.shape[1]})."
             )
 
-        n_samples = event_true.shape[0]
-        n_time_steps = times.shape[0]
-        brier_scores = np.empty(
-            shape=(n_samples, n_time_steps),
-            dtype=np.float64,
-        )
+        if self.event_of_interest == "any":
+            k = 1
+        else:
+            k = self.event_of_interest
+
+        # Vectorize the Brier score computation across all time steps at once
+        # using broadcasting.  Shapes: duration_true is (n_samples,), times is
+        # (n_times,).  We expand to (n_samples, 1) vs (1, n_times) so that
+        # every element-wise comparison produces an (n_samples, n_times) mask.
+        dur = duration_true[:, np.newaxis]  # (n_samples, 1)
+        t = times[np.newaxis, :]  # (1, n_times)
+
+        # Binary targets: 1 when event k occurred before the time horizon.
+        event_k_before_horizon = (event_true[:, np.newaxis] == k) & (dur <= t)
+        y_binary = event_k_before_horizon.astype(np.float64)
+
+        # IPCW weights at observation durations — one value per sample,
+        # independent of the time grid.
         ipcw_y = self.ipcw_estimator.compute_ipcw_at(duration_true)
-        for t_idx, t in enumerate(times):
-            y_true_binary, weights = self._weighted_binary_targets(
-                y_event=event_true,
-                y_duration=duration_true,
-                times=np.full(shape=n_samples, fill_value=t),
-                ipcw_y_duration=ipcw_y,
-            )
-            # XXX: refactor and rename this function to make it possible to
-            # also compute the time-dependent binary cross-entropy loss.
-            squared_error = (y_true_binary - y_pred[:, t_idx]) ** 2
-            brier_scores[:, t_idx] = weights * squared_error
+
+        # IPCW weights at each time-grid point — one value per time step,
+        # independent of the sample.  Called once for the full grid instead of
+        # once per time step.
+        ipcw_t = self.ipcw_estimator.compute_ipcw_at(times)
+
+        after_horizon = dur > t  # (n_samples, n_times)
+        weights = np.where(after_horizon, ipcw_t[np.newaxis, :], 0)
+
+        any_event_before_horizon = (event_true[:, np.newaxis] > 0) & (dur <= t)
+        weights = np.where(
+            any_event_before_horizon, ipcw_y[:, np.newaxis], weights
+        )
+
+        # XXX: refactor and rename this function to make it possible to
+        # also compute the time-dependent binary cross-entropy loss.
+        brier_scores = weights * (y_binary - y_pred) ** 2
 
         return brier_scores.mean(axis=0)
 

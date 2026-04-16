@@ -2,7 +2,6 @@ import warnings
 from collections import Counter, defaultdict
 
 import numpy as np
-from scipy.interpolate import interp1d
 
 from .._ipcw import KaplanMeierIPCW
 from ..utils import check_y_survival
@@ -393,21 +392,25 @@ class _StatsComputer:
             )
             stats["n_ties_times"] += n_ties_times
 
-            stats["n_pairs"] += duration.shape[0] - idx_acceptable
-            stats["weighted_pairs"] += self._compute_weights(
-                ipcw_i, ipcw[idx_acceptable:]
-            )
+            pred_tail = y_pred[idx_acceptable:]
+            ipcw_tail = ipcw[idx_acceptable:]
 
-            mask_ties_pred = np.abs(y_pred_i - y_pred[idx_acceptable:]) <= tied_tol
+            stats["n_pairs"] += ipcw_tail.shape[0]
+            stats["weighted_pairs"] += self._compute_weights(ipcw_i, ipcw_tail)
+
+            diff = y_pred_i - pred_tail
+            mask_ties_pred = np.abs(diff) <= tied_tol
+            # diff > tied_tol is equivalent to (y_pred_i > pred_tail) & ~mask_ties
+            mask_strict_concordant = diff > tied_tol
+
             stats["n_ties_pred"] += mask_ties_pred.sum()
             stats["weighted_ties_pred"] += self._compute_weights(
-                ipcw_i, ipcw[idx_acceptable:][mask_ties_pred]
+                ipcw_i, ipcw_tail[mask_ties_pred]
             )
 
-            mask_concordant = y_pred_i > y_pred[idx_acceptable:]
-            stats["n_concordant_pairs"] += (mask_concordant & ~mask_ties_pred).sum()
+            stats["n_concordant_pairs"] += mask_strict_concordant.sum()
             stats["weighted_concordant_pairs"] += self._compute_weights(
-                ipcw_i, ipcw[idx_acceptable:][mask_concordant & ~mask_ties_pred]
+                ipcw_i, ipcw_tail[mask_strict_concordant]
             )
 
         return stats
@@ -507,16 +510,24 @@ class _StatsComputerTypeB(_StatsComputer):
 
 def interpolate_preds(y_pred, time_grid, tau):
     """Interpolated the values of y_pred at tau."""
-    tau = np.clip(tau, min(time_grid), max(time_grid))
+    time_grid = np.asarray(time_grid)
+    order = np.argsort(time_grid)
+    sorted_grid = time_grid[order]
+    sorted_pred = y_pred[:, order]
 
-    n_samples = y_pred.shape[0]
-    y_pred_tau = np.zeros(n_samples)
-    for idx in range(n_samples):
-        y_pred_sample_at_tau = interp1d(
-            x=time_grid,
-            y=y_pred[idx, :],
-            kind="linear",
-        )(tau)
-        y_pred_tau[idx] = y_pred_sample_at_tau
+    tau = np.clip(tau, sorted_grid[0], sorted_grid[-1])
 
-    return y_pred_tau
+    idx_right = np.searchsorted(sorted_grid, tau, side="right")
+    idx_right = min(idx_right, len(sorted_grid) - 1)
+    idx_left = max(idx_right - 1, 0)
+
+    t_left = sorted_grid[idx_left]
+    t_right = sorted_grid[idx_right]
+
+    if t_right == t_left:
+        return sorted_pred[:, idx_left].copy()
+
+    alpha = (tau - t_left) / (t_right - t_left)
+    return sorted_pred[:, idx_left] + alpha * (
+        sorted_pred[:, idx_right] - sorted_pred[:, idx_left]
+    )

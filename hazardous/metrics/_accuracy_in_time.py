@@ -124,20 +124,27 @@ def accuracy_in_time(y_test, y_pred, time_grid, quantiles=None):
         taus = np.quantile(time_grid, quantiles, method="inverted_cdf")
     taus = np.unique(taus)
 
-    acc_in_time = []
+    # Extract numpy arrays once to avoid repeated pandas-to-numpy conversion
+    # inside the loop.
+    event_test = np.asarray(y_test["event"])
+    duration_test = np.asarray(y_test["duration"])
 
-    for tau in taus:
-        mask_past_censored = (y_test["event"] == 0) & (y_test["duration"] <= tau)
+    # Precompute indices into time_grid for each tau (all taus are guaranteed
+    # to be elements of time_grid).
+    tau_indices = np.searchsorted(time_grid, taus)
 
-        # tau is guaranteed to be in time_grid
-        tau_idx = np.argwhere(time_grid == tau).squeeze()
+    acc_in_time = np.empty(len(taus))
 
-        y_pred_at_t = y_pred[:, :, tau_idx]
-        y_pred_class = y_pred_at_t[~mask_past_censored, :].argmax(axis=1)
+    for i, tau in enumerate(taus):
+        mask_uncensored = ~((event_test == 0) & (duration_test <= tau))
 
-        y_test_class = y_test["event"] * (y_test["duration"] <= tau)
-        y_test_class = y_test_class.loc[~mask_past_censored].values
+        y_pred_at_t = y_pred[:, :, tau_indices[i]]
+        y_pred_class = y_pred_at_t[mask_uncensored, :].argmax(axis=1)
 
-        acc_in_time.append((y_test_class == y_pred_class).mean())
+        y_test_class = event_test[mask_uncensored] * (
+            duration_test[mask_uncensored] <= tau
+        )
 
-    return np.array(acc_in_time), taus
+        acc_in_time[i] = (y_test_class == y_pred_class).mean()
+
+    return acc_in_time, taus

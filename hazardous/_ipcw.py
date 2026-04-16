@@ -44,7 +44,7 @@ def _build_warm_start_estimator(estimator, estimator_params, default_params=None
         params["max_iter"] = 1
         return HistGradientBoostingClassifier(**params)
     else:
-        params = {"warm_start": True, **(estimator_params or {})}
+        params = {**(estimator_params or {}), "warm_start": True}
         clf = estimator(**params)
         # Force the starting iteration count to 1; the training loop will
         # increment it at each boosting step.

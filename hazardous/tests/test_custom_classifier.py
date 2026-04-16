@@ -182,7 +182,7 @@ def test_survival_boost_custom_hgb_params(train_test_data, ipcw_strategy):
 
 @pytest.mark.parametrize("ipcw_strategy", ["kaplan-meier", "alternating"])
 def test_survival_boost_gradient_boosting_classifier(train_test_data, ipcw_strategy):
-    """sklearn GradientBoostingClassifier (max_iter) works as custom estimator."""
+    """sklearn GradientBoostingClassifier (n_estimators) works as custom estimator."""
     X_train, X_test, y_train, _ = train_test_data
     est = SurvivalBoost(
         n_iter=3,

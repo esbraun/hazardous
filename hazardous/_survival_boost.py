@@ -462,11 +462,13 @@ class SurvivalBoost(BaseEstimator, ClassifierMixin):
         n_horizons = self.n_horizons_per_observation
         total_rows = n_samples * n_horizons
 
-        # Pre-allocate buffers once and reuse across all boosting iterations
-        # to avoid repeated vstack/hstack copies.
         X_with_time = np.empty((total_rows, X.shape[1] + 1))
         y_targets = np.empty(total_rows)
         sample_weight = np.empty(total_rows)
+
+        # X never changes, so fill feature columns once.
+        for j in range(n_horizons):
+            X_with_time[j * n_samples : (j + 1) * n_samples, 1:] = X
 
         for idx_iter in iterator:
             for j in range(n_horizons):
@@ -479,7 +481,6 @@ class SurvivalBoost(BaseEstimator, ClassifierMixin):
                 ) = self.weighted_targets_.draw(X=X, ipcw_training=False)
 
                 X_with_time[start:end, 0:1] = sampled_times_
-                X_with_time[start:end, 1:] = X
                 y_targets[start:end] = y_targets_
                 sample_weight[start:end] = sample_weight_
 
